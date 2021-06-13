@@ -1,16 +1,20 @@
 // SPDX-License-Identifier: MIT
 
-pragma solidity 0.6.12;
+pragma solidity ^0.6.12;
 
 import "https://github.com/OpenZeppelin/openzeppelin-contracts/blob/release-v3.1.0/contracts/access/Ownable.sol";
+import "https://github.com/OpenZeppelin/openzeppelin-contracts/blob/release-v3.1.0/contracts/math/SafeMath.sol";
 import "https://github.com/OpenZeppelin/openzeppelin-contracts/blob/release-v3.1.0/contracts/token/ERC20/SafeERC20.sol";
-import "https://github.com/OpenZeppelin/openzeppelin-contracts/blob/release-v3.1.0/contracts/utils/EnumerableSet.sol";
 import "https://github.com/OpenZeppelin/openzeppelin-contracts/blob/release-v3.1.0/contracts/utils/ReentrancyGuard.sol";
 
-import "./libs/IStrategy.sol";
-import "./libs/IReferral.sol";
 import "./OmenToken.sol";
 import "./Operators.sol";
+import "./libs/IReferral.sol";
+import "./AugurDividendsV1.sol";
+
+// MasterAugur sees all within Augury.
+// Eventually, this will be governed by our community.
+// Have fun reading it. Hopefully it's bug-free. God bless. :)
 
 contract MasterAugur is Ownable, ReentrancyGuard, Operators {
     using SafeMath for uint256;
@@ -18,62 +22,73 @@ contract MasterAugur is Ownable, ReentrancyGuard, Operators {
 
     // Info of each user.
     struct UserInfo {
-        uint256 shares; // How many LP tokens the user has provided.
-        uint256 rewardDebt; // Reward debt. See explanation below.
-
-        // We do some fancy math here. Basically, any point in time, the amount of AUTO
+        uint256 amount;         // How many LP tokens the user has provided.
+        uint256 rewardDebt;     // Reward debt. See explanation below.
+        uint256 dividends;      // Divvys
+        //
+        // We do some fancy math here. Basically, any point in time, the amount of OMEN
         // entitled to a user but is pending to be distributed is:
         //
-        //   amount = user.shares / sharesTotal * wantLockedTotal
-        //   pending reward = (amount * pool.accOMENPerShare) - user.rewardDebt
+        //   pending reward = (user.amount * pool.accOmenPerShare) - user.rewardDebt
         //
-        // Whenever a user deposits or withdraws want tokens to a pool. Here's what happens:
-        //   1. The pool's `accAUTOPerShare` (and `lastRewardBlock`) gets updated.
+        // Whenever a user deposits or withdraws LP tokens to a pool. Here's what happens:
+        //   1. The pool's `accOmenPerShare` (and `lastRewardBlock`) gets updated.
         //   2. User receives the pending reward sent to his/her address.
         //   3. User's `amount` gets updated.
         //   4. User's `rewardDebt` gets updated.
     }
 
+    // Info of each pool.
     struct PoolInfo {
-        IERC20 want; // Address of the want token.
-        uint256 allocPoint; // How many allocation points assigned to this pool. OMEN to distribute per block.
-        uint256 lastRewardBlock; // Last block number that OMEN distribution occurs.
-        uint256 accOmenPerShare; // Accumulated OMEN per share, times 1e18. See below.
-        address strat; // Strategy address that will auto compound want tokens
+        IERC20 lpToken;           // Address of LP token contract.
+        uint256 allocPoint;       // How many allocation points assigned to this pool. OMEN to distribute per block.
+        uint256 lastRewardBlock;  // Last block number that OMEN distribution occurs.
+        uint256 accOmenPerShare;   // Accumulated OMEN per share, times 1e18. See below.
+        uint16 depositFeeBP;      // Deposit fee in basis points
     }
 
     /* Augury: Omen */
     OmenToken public omen;
+    AugurDividendsV1 public dividends;
 
     /**
-     * Community & Developer
-     */
+        Advisors, Partners and Developers have a vesting schedule on their tokens (see below)
+    **/
     address public communityAddress;
     address public devAddress;
 
     // OMEN tokens created per block.
-    uint256 public constant maxSupply = 77777777 ether; // 77.77M
-    uint256 public omenPerBlock = 1770 finney; // 1.77
+    uint256 public maxSupply = 777777777 ether; // 777m
+    uint256 public omenPerBlock = 17777 finney; // 17.777
 
-    PoolInfo[] public poolInfo; // Info of each pool.
-    mapping(uint256 => mapping(address => UserInfo)) public userInfo; // Info of each user that stakes LP tokens.
-    mapping(address => bool) private strats;
+    // Info of each pool.
+    PoolInfo[] public poolInfo;
+    // Info of each user that stakes LP tokens.
+    mapping(uint256 => mapping(address => UserInfo)) public userInfo;
+    // Total allocation points. Must be the sum of all allocation points in all pools.
+    uint256 public totalAllocPoint = 0;
+    // The block number when OMEN mining starts.
+    uint256 public startBlock;
 
-    uint256 public startBlock = 77777777; 
-    uint256 public totalAllocPoint = 0; // Total allocation points. Must be the sum of all allocation points in all pools.
-    
     // Omen referrals contract address.
     IReferral public referral;
     // Referral commission rate in basis points.
-    uint16 public referralCommissionRate;
+    uint16 public referralCommissionRate = 0;
     // Max referral commission rate: 5%.
     uint16 public constant MAXIMUM_REFERRAL_COMMISSION_RATE = 500;
-    
+
+    // dividends
+    address public dividendsContractAddress;
+
+    /************************
+        Addresses 
+    *************************/
+
     // Vesting:
     event SetCommunityAddress(address indexed user, address indexed newAddress);
     event SetDevAddress(address indexed user, address indexed newAddress);
 
-    event AddPool(address indexed strat);
+    // Other/Misc:
     event Deposit(address indexed user, uint256 indexed pid, uint256 amount);
     event Withdraw(address indexed user, uint256 indexed pid, uint256 amount);
     event EmergencyWithdraw(address indexed user, uint256 indexed pid, uint256 amount);
@@ -81,68 +96,70 @@ contract MasterAugur is Ownable, ReentrancyGuard, Operators {
     // Referral bonuses:
     event SetReferralAddress(address indexed user, IReferral indexed newAddress);
     event ReferralCommissionPaid(address indexed user, address indexed referrer, uint256 commissionAmount);
-    
+
     // Allows us to change the emission rate (see gitbook)
     event UpdateEmissionRate(address indexed user, uint256 omenPerBlock);
     
+    // Watched by our Sentinel Auditing System. This function should only be used if the community requires it. 
+    event UpdateMaxSupply(address indexed user, uint256 maxSupply);
+    
     constructor(
         OmenToken _omen,
+        IERC20 _usdc,
         uint256 _startBlock,
         address _communityAddress,
-        address _devAddress,
-        IReferral _referralAddress,
-        uint16 _referralCommissionRate
+        address _devAddress
     ) public {
         omen = _omen;
         startBlock = _startBlock;
 
         communityAddress = _communityAddress;
         devAddress = _devAddress;
-        referral = _referralAddress;
-        referralCommissionRate = _referralCommissionRate;
+        
+        dividends = new AugurDividendsV1(_usdc);
+        // TODO: Determine which of these we should use...
+        dividends.updateOperator(_devAddress, true);
+        dividends.updateOperator(msg.sender, true);
+        dividends.updateOperator(address(this), true);
+        
+        dividendsContractAddress = address(dividends);
     }
 
     function poolLength() external view returns (uint256) {
         return poolInfo.length;
     }
 
-    /**
-     * @dev Add a new want to the pool. Can only be called by the owner.
-     */
-    function addPool(uint256 _allocPoint, address _strat) external onlyOwner nonReentrant {
-        require(!strats[_strat], "Existing strategy");
-        uint256 lastRewardBlock = block.number > startBlock ? block.number : startBlock;
-        poolInfo.push(
-            PoolInfo({
-                want: IERC20(IStrategy(_strat).wantAddress()),
-                allocPoint: _allocPoint,
-                lastRewardBlock: lastRewardBlock,
-                accOmenPerShare: 0,
-                strat: _strat
-            })
-        );
-        strats[_strat] = true;
-        resetSingleAllowance(poolInfo.length.sub(1));
-        emit AddPool(_strat);
+    mapping(IERC20 => bool) public poolExistence;
+    modifier nonDuplicated(IERC20 _lpToken) {
+        require(poolExistence[_lpToken] == false, "nonDuplicated: duplicated");
+        _;
     }
 
-    // Update the given pool's OMEN allocation point. Can only be called by the owner.
-    function set(
-        uint256 _pid,
-        uint256 _allocPoint
-    ) public onlyOwner {
-        totalAllocPoint = totalAllocPoint.sub(poolInfo[_pid].allocPoint).add(
-            _allocPoint
-        );
-        poolInfo[_pid].allocPoint = _allocPoint;
+    // Add a new lp to the pool. Can only be called by the owner.
+    function add(uint256 _allocPoint, IERC20 _lpToken, uint16 _depositFeeBP) external onlyOwner nonDuplicated(_lpToken) {
+        require(_depositFeeBP <= 10000, "add: invalid deposit fee basis points");
+        uint256 lastRewardBlock = block.number > startBlock ? block.number : startBlock;
+        totalAllocPoint = totalAllocPoint.add(_allocPoint);
+        poolExistence[_lpToken] = true;
+        poolInfo.push(PoolInfo({
+            lpToken: _lpToken,
+            allocPoint: _allocPoint,
+            lastRewardBlock: lastRewardBlock,
+            accOmenPerShare: 0,
+            depositFeeBP: _depositFeeBP
+        }));
     }
-    
+
+    // Update the given pool's OMEN allocation point and deposit fee. Can only be called by the owner.
+    function set(uint256 _pid, uint256 _allocPoint, uint16 _depositFeeBP) external onlyOwner {
+        require(_depositFeeBP <= 10000, "set: invalid deposit fee basis points");
+        totalAllocPoint = totalAllocPoint.sub(poolInfo[_pid].allocPoint).add(_allocPoint);
+        poolInfo[_pid].allocPoint = _allocPoint;
+        poolInfo[_pid].depositFeeBP = _depositFeeBP;
+    }
+
     // Return reward multiplier over the given _from to _to block.
-    function getMultiplier(uint256 _from, uint256 _to)
-        public
-        view
-        returns (uint256)
-    {
+    function getMultiplier(uint256 _from, uint256 _to) public view returns (uint256) {
         if (omen.totalSupply() >= maxSupply) {
             return 0;
         }
@@ -154,27 +171,13 @@ contract MasterAugur is Ownable, ReentrancyGuard, Operators {
         PoolInfo storage pool = poolInfo[_pid];
         UserInfo storage user = userInfo[_pid][_user];
         uint256 accOmenPerShare = pool.accOmenPerShare;
-        uint256 sharesTotal = IStrategy(pool.strat).sharesTotal();
-        if (block.number > pool.lastRewardBlock && sharesTotal != 0) {
+        uint256 lpSupply = pool.lpToken.balanceOf(address(this));
+        if (block.number > pool.lastRewardBlock && lpSupply != 0) {
             uint256 multiplier = getMultiplier(pool.lastRewardBlock, block.number);
             uint256 omenReward = multiplier.mul(omenPerBlock).mul(pool.allocPoint).div(totalAllocPoint);
-            accOmenPerShare = accOmenPerShare.add(omenReward.mul(1e18).div(sharesTotal));
+            accOmenPerShare = accOmenPerShare.add(omenReward.mul(1e18).div(lpSupply));
         }
-        return user.shares.mul(accOmenPerShare).div(1e18).sub(user.rewardDebt);
-    }
-
-
-    // View function to see staked Want tokens on frontend.
-    function stakedWantTokens(uint256 _pid, address _user) external view returns (uint256) {
-        PoolInfo storage pool = poolInfo[_pid];
-        UserInfo storage user = userInfo[_pid][_user];
-
-        uint256 sharesTotal = IStrategy(pool.strat).sharesTotal();
-        uint256 wantLockedTotal = IStrategy(poolInfo[_pid].strat).wantLockedTotal();
-        if (sharesTotal == 0) {
-            return 0;
-        }
-        return user.shares.mul(wantLockedTotal).div(sharesTotal);
+        return user.amount.mul(accOmenPerShare).div(1e18).sub(user.rewardDebt);
     }
 
     // Update reward variables for all pools. Be careful of gas spending!
@@ -191,144 +194,111 @@ contract MasterAugur is Ownable, ReentrancyGuard, Operators {
         if (block.number <= pool.lastRewardBlock) {
             return;
         }
-        uint256 sharesTotal = IStrategy(pool.strat).sharesTotal();
-        uint256 multiplier = getMultiplier(pool.lastRewardBlock, block.number);
-        if (sharesTotal == 0 || pool.allocPoint == 0 || multiplier == 0) {
+        uint256 lpSupply = pool.lpToken.balanceOf(address(this));
+        if (lpSupply == 0 || pool.allocPoint == 0) {
             pool.lastRewardBlock = block.number;
             return;
         }
+        uint256 multiplier = getMultiplier(pool.lastRewardBlock, block.number);
         uint256 omenReward = multiplier.mul(omenPerBlock).mul(pool.allocPoint).div(totalAllocPoint);
         omen.mint(devAddress, omenReward.div(10));
         omen.mint(address(this), omenReward);
-        pool.accOmenPerShare = pool.accOmenPerShare.add(omenReward.mul(1e18).div(sharesTotal));
+        pool.accOmenPerShare = pool.accOmenPerShare.add(omenReward.mul(1e18).div(lpSupply));
         pool.lastRewardBlock = block.number;
     }
-
-
-    // Want tokens moved from user -> this -> Strat (compounding)
-    function deposit(uint256 _pid, uint256 _wantAmt) external nonReentrant {
-        _deposit(_pid, _wantAmt, msg.sender);
-    }
-
-    // For unique contract calls
-    function deposit(uint256 _pid, uint256 _wantAmt, address _to) external nonReentrant onlyOperator {
-        _deposit(_pid, _wantAmt, _to);
+    
+    function deposit(uint256 _pid, uint256 _amount, address _referrer) external nonReentrant {
+        _deposit(_pid, _amount, msg.sender, _referrer);
     }
     
-    function _deposit(uint256 _pid, uint256 _wantAmt, address _to) internal {
+    function withdraw(uint256 _pid, uint256 _amount) external nonReentrant {
+        _withdraw(_pid, _amount, msg.sender);
+    }
+    
+    // Restricted deposit function for our own contracts
+    function deposit(uint256 _pid, uint256 _amount, address _to, address _referrer) external nonReentrant onlyOperator {
+        _deposit(_pid, _amount, _to, _referrer);
+    }
+    
+    // Restricted withdraw function for our own contracts
+    function withdraw(uint256 _pid, uint256 _amount, address _to) external nonReentrant onlyOperator {
+        _withdraw(_pid, _amount, _to);
+    }
+    
+    // Deposit LP tokens to MasterAugur for OMEN allocation.
+    function _deposit(uint256 _pid, uint256 _amount, address _to, address _referrer) internal {
         PoolInfo storage pool = poolInfo[_pid];
         UserInfo storage user = userInfo[_pid][_to];
-
-        // Withdraw pending Omen
-        if (user.shares > 0) {
-            uint256 pending = user.shares.mul(pool.accOmenPerShare).div(1e18).sub(user.rewardDebt);
+        updatePool(_pid);
+        if (_amount > 0 && address(referral) != address(0) && _referrer != address(0) && _referrer != _to) {
+            referral.recordReferral(_to, _referrer);
+        }
+        if (user.amount > 0) {
+            uint256 pending = user.amount.mul(pool.accOmenPerShare).div(1e18).sub(user.rewardDebt);
             if (pending > 0) {
                 safeOmenTransfer(_to, pending);
+                payReferralCommission(_to, pending);
             }
         }
-        if (_wantAmt > 0) {
-            pool.want.safeTransferFrom(msg.sender, address(this), _wantAmt);
-
-            uint256 sharesAdded = IStrategy(poolInfo[_pid].strat).deposit(_to, _wantAmt);
-            user.shares = user.shares.add(sharesAdded);
+        if (_amount > 0) {
+            pool.lpToken.safeTransferFrom(msg.sender, address(this), _amount);
+            if (pool.depositFeeBP > 0) {
+                uint256 depositFee = _amount.mul(pool.depositFeeBP).div(10000);
+                pool.lpToken.safeTransfer(devAddress, depositFee.mul(4).div(10));
+                pool.lpToken.safeTransfer(communityAddress, depositFee.mul(6).div(10));
+                user.amount = user.amount.add(_amount).sub(depositFee);
+            } else {
+                user.amount = user.amount.add(_amount);
+            }
         }
-        user.rewardDebt = user.shares.mul(pool.accOmenPerShare).div(1e18);
-        emit Deposit(_to, _pid, _wantAmt);
+        user.rewardDebt = user.amount.mul(pool.accOmenPerShare).div(1e18);
+
+        dividends.setUserStakedAmount(_pid, _to, user.amount);
+        emit Deposit(_to, _pid, _amount);
     }
 
     // Withdraw LP tokens from MasterChef.
-    function withdraw(uint256 _pid, uint256 _wantAmt) external nonReentrant {
-        _withdraw(_pid, _wantAmt, msg.sender);
-    }
-
-    // For unique contract calls
-    function withdraw(uint256 _pid, uint256 _wantAmt, address _to) external nonReentrant onlyOperator {
-        _withdraw(_pid, _wantAmt, _to);
-    }
-
-    function _withdraw(uint256 _pid, uint256 _wantAmt, address _to) internal {
+    function _withdraw(uint256 _pid, uint256 _amount, address _to) internal {
         PoolInfo storage pool = poolInfo[_pid];
         UserInfo storage user = userInfo[_pid][msg.sender];
-
-        uint256 wantLockedTotal = IStrategy(poolInfo[_pid].strat).wantLockedTotal();
-        uint256 sharesTotal = IStrategy(poolInfo[_pid].strat).sharesTotal();
-
-        require(user.shares > 0, "user.shares is 0");
-        require(sharesTotal > 0, "sharesTotal is 0");
-        
-        // Withdraw pending Omen
-        uint256 pending = user.shares.mul(pool.accOmenPerShare).div(1e18).sub(user.rewardDebt);
+        require(user.amount >= _amount, "withdraw: not good");
+        updatePool(_pid);
+        uint256 pending = user.amount.mul(pool.accOmenPerShare).div(1e18).sub(user.rewardDebt);
         if (pending > 0) {
             safeOmenTransfer(_to, pending);
+            payReferralCommission(msg.sender, pending);
         }
-
-        // Withdraw want tokens
-        uint256 amount = user.shares.mul(wantLockedTotal).div(sharesTotal);
-        if (_wantAmt > amount) {
-            _wantAmt = amount;
+        if (_amount > 0) {
+            user.amount = user.amount.sub(_amount);
+            pool.lpToken.safeTransfer(_to, _amount);
         }
-        if (_wantAmt > 0) {
-            uint256 sharesRemoved = IStrategy(poolInfo[_pid].strat).withdraw(msg.sender, _wantAmt);
+        user.rewardDebt = user.amount.mul(pool.accOmenPerShare).div(1e18);
 
-            if (sharesRemoved > user.shares) {
-                user.shares = 0;
-            } else {
-                user.shares = user.shares.sub(sharesRemoved);
-            }
-
-            uint256 wantBal = IERC20(pool.want).balanceOf(address(this));
-            if (wantBal < _wantAmt) {
-                _wantAmt = wantBal;
-            }
-            pool.want.safeTransfer(_to, _wantAmt);
-        }
-        user.rewardDebt = user.shares.mul(pool.accOmenPerShare).div(1e18);
-        emit Withdraw(msg.sender, _pid, _wantAmt);
-    }
-
-    // Withdraw everything from pool for yourself
-    function withdrawAll(uint256 _pid) external {
-        _withdraw(_pid, uint256(-1), msg.sender);
+        dividends.setUserStakedAmount(_pid, _to,  user.amount);
+        emit Withdraw(msg.sender, _pid, _amount);
     }
 
     // Withdraw without caring about rewards. EMERGENCY ONLY.
     function emergencyWithdraw(uint256 _pid) external nonReentrant {
         PoolInfo storage pool = poolInfo[_pid];
         UserInfo storage user = userInfo[_pid][msg.sender];
-
-        uint256 wantLockedTotal = IStrategy(poolInfo[_pid].strat).wantLockedTotal();
-        uint256 sharesTotal = IStrategy(poolInfo[_pid].strat).sharesTotal();
-        uint256 amount = user.shares.mul(wantLockedTotal).div(sharesTotal);
-
-        IStrategy(poolInfo[_pid].strat).withdraw(msg.sender, amount);
-
-        pool.want.safeTransfer(address(msg.sender), amount);
-        emit EmergencyWithdraw(msg.sender, _pid, amount);
-        user.shares = 0;
+        uint256 amount = user.amount;
+        user.amount = 0;
         user.rewardDebt = 0;
+        pool.lpToken.safeTransfer(address(msg.sender), amount);
+        emit EmergencyWithdraw(msg.sender, _pid, amount);
     }
-    
-    function safeOmenTransfer(address _to, uint256 _amt) internal {
-        uint256 bal = omen.balanceOf(address(this));
-        if (_amt > bal) {
-            omen.transfer(_to, bal);
+
+    // Safe omen transfer function, just in case if rounding error causes pool to not have enough OMEN.
+    function safeOmenTransfer(address _to, uint256 _amount) internal {
+        uint256 omenBalance = omen.balanceOf(address(this));
+        bool transferSuccess = false;
+        if (_amount > omenBalance) {
+            transferSuccess = omen.transfer(_to, omenBalance);
         } else {
-            omen.transfer(_to, _amt);
+            transferSuccess = omen.transfer(_to, _amount);
         }
-    }
-
-    function resetAllowances() external onlyOwner {
-        for (uint256 i=0; i<poolInfo.length; i++) {
-            PoolInfo storage pool = poolInfo[i];
-            pool.want.safeApprove(pool.strat, uint256(0));
-            pool.want.safeIncreaseAllowance(pool.strat, uint256(-1));
-        }
-    }
-
-    function resetSingleAllowance(uint256 _pid) public onlyOwner {
-        PoolInfo storage pool = poolInfo[_pid];
-        pool.want.safeApprove(pool.strat, uint256(0));
-        pool.want.safeIncreaseAllowance(pool.strat, uint256(-1));
+        require(transferSuccess, "safeOmenTransfer: Transfer failed");
     }
 
     function setCommunityAddress(address _communityAddress) external onlyOwner {
@@ -345,6 +315,12 @@ contract MasterAugur is Ownable, ReentrancyGuard, Operators {
         massUpdatePools();
         omenPerBlock = _omenPerBlock;
         emit UpdateEmissionRate(msg.sender, _omenPerBlock);
+    }
+    
+    function updateMaxSupply(uint256 _maxSupply) external onlyOwner {
+
+        maxSupply = _maxSupply;
+        emit UpdateMaxSupply(msg.sender, _maxSupply);
     }
 
     // Update the referral contract address by the owner
@@ -378,4 +354,12 @@ contract MasterAugur is Ownable, ReentrancyGuard, Operators {
         startBlock = _startBlock;
     }
 
+    // Dividends
+    function calculateRequestorDividendsAmountFromNow() external view returns (uint256) {
+        return dividends.calculateOwedDividendsFromNow_d6(msg.sender);
+    }
+
+    function collectDividends() external {
+        dividends.collectUserDividends(msg.sender);
+    }
 }
