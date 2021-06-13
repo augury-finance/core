@@ -13,7 +13,7 @@ The `OMEN` token contains governance information so that eventually our communit
 
 Migrator functionality has been removed. Augury Finance cannot migrate your funds.
 
-For your protection, fees introduced in the Strategies have limits. The starting deposit fee is 4% and there are no withdrawal fees (0%).
+The starting deposit fee on most of our pools (except OMEN/OMEN-USDC) is 4% and there are no withdrawal fees (0%).
 
 The `emergencyWithdraw()` method on `MasterAugur` has been included so that you can call this directly through the Mainnet. For details on this, please visit our Gitbook!
 
