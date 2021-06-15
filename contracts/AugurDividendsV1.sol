@@ -1,4 +1,12 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Augury Finance
+// COPIED FROM https://github.com/compound-finance/compound-protocol/blob/master/contracts/Governance/GovernorAlpha.sol
+// Copyright Augury Finance, 2021. Do not re-use without permission.
+// Redistribution and use in source and binary forms, with or without modification, are permitted provided that the following conditions are met:
+// 1. Redistributions of source code must retain the above copyright notice, this list of conditions and the following disclaimer.
+// 2. Redistributions in binary form must reproduce the above copyright notice, this list of conditions and the following disclaimer in the documentation and/or other materials provided with the distribution.
+// 3. Neither the name of the copyright holder nor the names of its contributors may be used to endorse or promote products derived from this software without specific prior written permission.
+// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+//
 
 pragma solidity ^0.6.12;
 
@@ -7,9 +15,10 @@ import "https://github.com/OpenZeppelin/openzeppelin-contracts/blob/release-v3.1
 import "https://github.com/OpenZeppelin/openzeppelin-contracts/blob/release-v3.1.0/contracts/token/ERC20/SafeERC20.sol";
 import "https://github.com/OpenZeppelin/openzeppelin-contracts/blob/release-v3.1.0/contracts/utils/ReentrancyGuard.sol";
 
+import "./libs/IDividends.sol";
 import "./Operators.sol";
 
-contract AugurDividendsV1 is Ownable, ReentrancyGuard, Operators {
+contract AugurDividendsV1 is Ownable, ReentrancyGuard, Operators, IDividends {
     using SafeMath for uint256;
     using SafeERC20 for IERC20;
 
@@ -19,34 +28,45 @@ contract AugurDividendsV1 is Ownable, ReentrancyGuard, Operators {
 
         uint256 lpUsdcToDistribute_d6;
         uint256 nlpUsdcToDistribute_d6;
-
-        bool usdcFunded;
     }
 
     struct UserInfo {
-        uint256 lastZeroStakedTime;
-        uint256 lastPositiveStakedTime;
+        uint256 lastNlpPositiveStakedTime;
+        uint256 lastNlpZeroStakedTime;
+        
+        uint256 lastLpPositiveStakedTime;
+        uint256 lastLpZeroStakedTime;
 
         uint256 lastEpochClaimed;
-        uint256 lastEpochPended;
-
-        uint256 pendingUsdc_d6;
 
         uint256 lpOmenStaked_d18;
         uint256 nlpOmenStaked_d18;
+
+        uint256 lastEpochPended;
+        uint256 pendingUsdc_d6;
     }
+
+    uint256 public constant MAX_UINT_256 = uint256(-1);
 
     IERC20 public dividendToken;
 
     uint256 public epochDurationSeconds;
+    // TODO: rename this to epochStartSecondsOffset
+    uint256 public epochDurationSecondsOffset;
     uint256 public lastClosedEpoch;
     uint256 public lastFundedEpoch;
+    uint256 public lastFundedAtUtcSeconds;
 
     uint256 public totalLpOmenStaked_d18;
     uint256 public totalNlpOmenStaked_d18;
 
     mapping(uint256 => EpochInfo) public epochInfos;
     mapping(address => UserInfo) public userInfos;
+    mapping(address => mapping(uint256 => uint256)) public userStakeHistories_nlp;
+    mapping(address => mapping(uint256 => uint256)) public userStakeHistories_lp;
+    mapping(uint256 => bool) public pidIsNlpPool;
+    mapping(uint256 => bool) public pidIsLpPool;
+    address[] public stakedUserAddresses;
 
     event DividendsCollected(address indexed user, uint256 amount);
 
@@ -55,6 +75,17 @@ contract AugurDividendsV1 is Ownable, ReentrancyGuard, Operators {
 
         // 1 week
         epochDurationSeconds = 1 weeks;
+        // Fri May 28 2021 09:00:00 GMT-0500 (Central Daylight Time)
+        epochDurationSecondsOffset = 1622210400;
+
+        // staging:
+        // 1 hours
+        // epochDurationSeconds = 1 hours;
+        // Tue Jun 15 2021 06:00:00 GMT-0500 (Central Daylight Time)
+        // epochDurationSecondsOffset = 1623754800;
+
+        require((now - 2 * epochDurationSeconds) > epochDurationSecondsOffset, "epochDurationSecondsOffset must be at least two epochs in the past.");
+
         lastClosedEpoch = secondsToEpoch(getNow()) - 1;
         lastFundedEpoch = secondsToEpoch(getNow()) - 1;
 
@@ -64,6 +95,21 @@ contract AugurDividendsV1 is Ownable, ReentrancyGuard, Operators {
 
     function getNow() public virtual view returns (uint256) {
         return now;
+    }
+
+    function getUserLastNlpStakedTime(address _user) public view returns (uint256) {
+        return userInfos[_user].lastNlpPositiveStakedTime > userInfos[_user].lastNlpZeroStakedTime ? userInfos[_user].lastNlpPositiveStakedTime
+            : userInfos[_user].lastNlpZeroStakedTime;
+    }
+
+    function getUserLastLpStakedTime(address _user) public view returns (uint256) {
+        return userInfos[_user].lastLpPositiveStakedTime > userInfos[_user].lastLpZeroStakedTime ? userInfos[_user].lastLpPositiveStakedTime
+            : userInfos[_user].lastLpZeroStakedTime;
+    }
+
+    function hasUserStaked(address _user) public view returns (bool) {
+        return userInfos[_user].lastLpPositiveStakedTime > 0 ||
+            userInfos[_user].lastNlpPositiveStakedTime > 0;
     }
 
     // Calculations...
@@ -79,7 +125,11 @@ contract AugurDividendsV1 is Ownable, ReentrancyGuard, Operators {
     }
     
     function secondsToEpoch(uint256 _seconds) public view returns (uint256) {
-        return _seconds.div(epochDurationSeconds);
+        return (_seconds - epochDurationSecondsOffset).div(epochDurationSeconds);
+    }
+
+    function currentEpoch() public view returns (uint256) {
+        return secondsToEpoch(getNow());
     }
 
     function calculateOwedDividends_d6(address _address, uint256 _requestedEpoch) public view returns (uint256) {
@@ -89,42 +139,45 @@ contract AugurDividendsV1 is Ownable, ReentrancyGuard, Operators {
             lastEpoch = lastFundedEpoch;
         }
 
+        // return lastFundedEpoch;
+        //  userInfos[_address].lastEpochClaimed;
         if (lastEpoch <= userInfos[_address].lastEpochClaimed) {
             return 0;
         }
 
-        // epoch difference is the difference between the lastEpoch
-        // and the max of
-        // -> lastEpochClaimed
-        // -> lastEpochPended
-        // -> lastZeroEpoch
-        uint256 maxAffectableEpoch = userInfos[_address].lastEpochClaimed;
-        if (maxAffectableEpoch < userInfos[_address].lastEpochPended) {
-            maxAffectableEpoch = userInfos[_address].lastEpochPended;
-        }
-        uint256 _lastZeroStakedEpoch = secondsToEpoch(userInfos[_address].lastZeroStakedTime);
-        if(maxAffectableEpoch < _lastZeroStakedEpoch) {
-            maxAffectableEpoch = _lastZeroStakedEpoch;
+        // the user has never staked with us, so they have no rewards...
+        // TODO: add unit test
+        if(!hasUserStaked(_address)) {
+            return 0;
         }
 
-        uint256 _userNlpStakedAmount_d18 = userInfos[_address].nlpOmenStaked_d18;
-        uint256 _userLpStakedAmount_d18 = userInfos[_address].lpOmenStaked_d18;
+        if(userInfos[_address].lastEpochClaimed == 0) {
+            return 0;
+        }
 
-        uint256 _total = userInfos[_address].pendingUsdc_d6;
-        for (uint256 pastEpoch = maxAffectableEpoch + 1; pastEpoch <= lastEpoch; pastEpoch++) {
-            if(_userNlpStakedAmount_d18 > 0) {
+        uint256 _userNlpStakedAmount_d18 = 0;
+        uint256 _userLpStakedAmount_d18 = 0; 
+        
+        uint256 _total = 0;
+        for (uint256 pastEpoch = userInfos[_address].lastEpochClaimed + 1; pastEpoch <= lastEpoch; pastEpoch++) {
+            _userNlpStakedAmount_d18 = userStakeHistories_nlp[_address][pastEpoch] == 0 ? _userNlpStakedAmount_d18
+                : userStakeHistories_nlp[_address][pastEpoch];
+            _userLpStakedAmount_d18 = userStakeHistories_lp[_address][pastEpoch] == 0 ? _userLpStakedAmount_d18
+                : userStakeHistories_lp[_address][pastEpoch];
+
+            if(_userNlpStakedAmount_d18 > 0 && _userNlpStakedAmount_d18 != MAX_UINT_256) {
                 _total = _total.add(calculateEpochUsdcAmount_d6(epochInfos[pastEpoch].nlpUsdcToDistribute_d6, epochInfos[pastEpoch].nlpOmenStaked_d18, _userNlpStakedAmount_d18));
             }
 
-            if(_userLpStakedAmount_d18 > 0) {
+            if(_userLpStakedAmount_d18 > 0 && _userNlpStakedAmount_d18 != MAX_UINT_256) {
                 _total = _total.add(calculateEpochUsdcAmount_d6(epochInfos[pastEpoch].lpUsdcToDistribute_d6, epochInfos[pastEpoch].lpOmenStaked_d18, _userLpStakedAmount_d18));
             }
         }
 
         return _total;
     }
-    function calculateOwedDividendsFromNow_d6(address _address) public view returns (uint256) {
-        return calculateOwedDividends_d6(_address, lastClosedEpoch);
+    function calculateOwedDividendsFromNow_d6(address _address) external view returns (uint256) {
+        return calculateOwedDividends_d6(_address, lastFundedEpoch);
     }
 
     // contract state
@@ -138,8 +191,7 @@ contract AugurDividendsV1 is Ownable, ReentrancyGuard, Operators {
     }
     function closePreviousOpenEpochsFromNow() public {
         // this can be public because it is idempotent
-        uint256 _currentEpoch = secondsToEpoch(getNow());
-        _closeOpenEpochs(_currentEpoch);
+        _closeOpenEpochs(currentEpoch());
     }
     
     function fundEpochDistributions(uint256 _epoch, uint256 _nlpUsdc_d6, uint256 _lpUsdc_d6) external onlyOperator nonReentrant {
@@ -151,10 +203,12 @@ contract AugurDividendsV1 is Ownable, ReentrancyGuard, Operators {
         epochInfos[_epoch].nlpUsdcToDistribute_d6 = _nlpUsdc_d6;
         epochInfos[_epoch].lpUsdcToDistribute_d6 = _lpUsdc_d6;
         lastFundedEpoch = _epoch;
+        lastFundedAtUtcSeconds = now;
     }
 
     // user state
     function _setUserStakedAmount(uint256 _pid, address _userAddress, uint256 _omenTotalStakedAmount_d18) private nonReentrant {
+        uint256 _currentEpoch = currentEpoch();
         closePreviousOpenEpochsFromNow();
         
         uint256 _lastStakedAmount = userInfos[_userAddress].nlpOmenStaked_d18;
@@ -162,10 +216,11 @@ contract AugurDividendsV1 is Ownable, ReentrancyGuard, Operators {
             _lastStakedAmount = userInfos[_userAddress].lpOmenStaked_d18;
         }
 
-        // when the user changes their stake in a current epoch
-        // we update their pending stake for all previous epochs
-        userInfos[_userAddress].pendingUsdc_d6 = calculateOwedDividends_d6(_userAddress, lastClosedEpoch);
-        userInfos[_userAddress].lastEpochPended = lastClosedEpoch;
+        // when the user first stakes with us, we need to set their lastFundedEpoch to the last epoch.
+        if(!hasUserStaked(_userAddress)) {
+            userInfos[_userAddress].lastEpochClaimed = lastFundedEpoch;
+            stakedUserAddresses.push(_userAddress);
+        }
 
         // when the user removes stake
         uint256 _decrementTotalBy = 0;
@@ -180,31 +235,55 @@ contract AugurDividendsV1 is Ownable, ReentrancyGuard, Operators {
         }
 
         if(_pid == 0) {
-            totalNlpOmenStaked_d18 = totalNlpOmenStaked_d18.add(_incrementTotalBy).sub(_decrementTotalBy);
             userInfos[_userAddress].nlpOmenStaked_d18 = _omenTotalStakedAmount_d18;
-        } else {
-            totalLpOmenStaked_d18 = totalLpOmenStaked_d18.add(_incrementTotalBy).sub(_decrementTotalBy);
-            userInfos[_userAddress].lpOmenStaked_d18 = _omenTotalStakedAmount_d18;
-        }
+            totalNlpOmenStaked_d18 = totalNlpOmenStaked_d18.add(_incrementTotalBy).sub(_decrementTotalBy);
+            userStakeHistories_nlp[_userAddress][_currentEpoch] = _omenTotalStakedAmount_d18;
+            if(_omenTotalStakedAmount_d18 == 0) {
+                userStakeHistories_nlp[_userAddress][_currentEpoch] = MAX_UINT_256;
+            }
 
-        if(userInfos[_userAddress].nlpOmenStaked_d18 == 0 && userInfos[_userAddress].lpOmenStaked_d18 == 0) {
-            userInfos[_userAddress].lastZeroStakedTime = getNow();
+            if(_omenTotalStakedAmount_d18 == 0) {
+                userInfos[_userAddress].lastNlpZeroStakedTime = getNow();
+            } else {
+                userInfos[_userAddress].lastNlpPositiveStakedTime = getNow();
+            }
         } else {
-            userInfos[_userAddress].lastPositiveStakedTime = getNow();
+            // this will only be the pid 1
+            userInfos[_userAddress].lpOmenStaked_d18 = _omenTotalStakedAmount_d18;
+            totalLpOmenStaked_d18 = totalLpOmenStaked_d18.add(_incrementTotalBy).sub(_decrementTotalBy);
+            userStakeHistories_lp[_userAddress][_currentEpoch] = _omenTotalStakedAmount_d18;
+            if(_omenTotalStakedAmount_d18 == 0) {
+                userStakeHistories_lp[_userAddress][_currentEpoch] = MAX_UINT_256;
+            }
+
+            if(_omenTotalStakedAmount_d18 == 0) {
+                userInfos[_userAddress].lastLpZeroStakedTime = getNow();
+            } else {
+                userInfos[_userAddress].lastLpPositiveStakedTime = getNow();
+            }
         }
     }
-    function setUserStakedAmount(uint256 _pid, address _userAddress, uint256 _omenTotalStakedAmount_d18) external onlyOwner {
+    function setUserStakedAmount(uint256 _pid, address _userAddress, uint256 _omenTotalStakedAmount_d18) external override onlyOwner {
+        // only add liquidity if the pool supports dividends
+        if(_pid != 0 && _pid != 1) {
+            return;
+        }
+
         _setUserStakedAmount(_pid, _userAddress, _omenTotalStakedAmount_d18);
     }
 
     function _collectDividends(address _userAddress) private nonReentrant returns (uint256) {
         closePreviousOpenEpochsFromNow();
 
-        require(lastClosedEpoch == lastFundedEpoch, "USDC must be funded before you may collect dividends");
+        require(userInfos[_userAddress].lastLpPositiveStakedTime > 0 || userInfos[_userAddress].lastNlpPositiveStakedTime > 0, "you must stake tokens before you are eligible to claim dividends.");
+        
+        uint256 _totalDividends = calculateOwedDividends_d6(_userAddress, lastFundedEpoch);
+        uint lastNlpStakeChangedEpoch = secondsToEpoch(getUserLastNlpStakedTime(_userAddress));
+        uint lastLpStakeChangedEpoch = secondsToEpoch(getUserLastLpStakedTime(_userAddress));
 
-        uint256 _totalDividends = calculateOwedDividends_d6(_userAddress, lastClosedEpoch);
-        userInfos[_userAddress].pendingUsdc_d6 = 0;
-        userInfos[_userAddress].lastEpochClaimed = lastClosedEpoch;
+        userStakeHistories_nlp[_userAddress][lastFundedEpoch + 1] = userStakeHistories_nlp[_userAddress][lastNlpStakeChangedEpoch];
+        userStakeHistories_lp[_userAddress][lastFundedEpoch + 1] = userStakeHistories_lp[_userAddress][lastLpStakeChangedEpoch];
+        userInfos[_userAddress].lastEpochClaimed = lastFundedEpoch;
 
         if (_totalDividends == 0) {
             return 0;
@@ -214,10 +293,17 @@ contract AugurDividendsV1 is Ownable, ReentrancyGuard, Operators {
 
         emit DividendsCollected(_userAddress, _totalDividends);
     }
-    function collectUserDividends(address _userAddress) external onlyOwner returns (uint256) {
-        return _collectDividends(_userAddress);
-    }
     function collectDividends() external returns (uint256) {
         return _collectDividends(msg.sender);
+    }
+
+    // this method will allow us to completely flush this contract when we migrate to a new dividends contract.
+    function distributeUnclaimedDividends(uint256 _from, uint256 _to) external {
+        require(_from < _to, "_from must be less than _to.");
+        require(_to < stakedUserAddresses.length, "_to must be less than the number of staked users.");
+
+        for(uint256 i = _from; i < _to; i++) {
+            _collectDividends(stakedUserAddresses[i]);
+        }
     }
 }
