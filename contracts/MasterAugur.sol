@@ -9,6 +9,7 @@ import "https://github.com/OpenZeppelin/openzeppelin-contracts/blob/release-v3.1
 
 import "./OmenToken.sol";
 import "./Operators.sol";
+import "./libs/IDividends.sol";
 import "./libs/IReferral.sol";
 import "./AugurDividendsV1.sol";
 
@@ -24,7 +25,6 @@ contract MasterAugur is Ownable, ReentrancyGuard, Operators {
     struct UserInfo {
         uint256 amount;         // How many LP tokens the user has provided.
         uint256 rewardDebt;     // Reward debt. See explanation below.
-        uint256 dividends;      // Divvys
         //
         // We do some fancy math here. Basically, any point in time, the amount of OMEN
         // entitled to a user but is pending to be distributed is:
@@ -49,7 +49,7 @@ contract MasterAugur is Ownable, ReentrancyGuard, Operators {
 
     /* Augury: Omen */
     OmenToken public omen;
-    AugurDividendsV1 public dividends;
+    IDividends public dividends;
 
     /**
         Advisors, Partners and Developers have a vesting schedule on their tokens (see below)
@@ -136,7 +136,7 @@ contract MasterAugur is Ownable, ReentrancyGuard, Operators {
     }
 
     // Add a new lp to the pool. Can only be called by the owner.
-    function add(uint256 _allocPoint, IERC20 _lpToken, uint16 _depositFeeBP) external onlyOwner nonDuplicated(_lpToken) {
+    function _addPool(uint256 _allocPoint, IERC20 _lpToken, uint16 _depositFeeBP) private {
         require(_depositFeeBP <= 10000, "add: invalid deposit fee basis points");
         uint256 lastRewardBlock = block.number > startBlock ? block.number : startBlock;
         totalAllocPoint = totalAllocPoint.add(_allocPoint);
@@ -149,13 +149,25 @@ contract MasterAugur is Ownable, ReentrancyGuard, Operators {
             depositFeeBP: _depositFeeBP
         }));
     }
+    function add(uint256 _allocPoint, IERC20 _lpToken, uint16 _depositFeeBP) external onlyOwner nonDuplicated(_lpToken) {
+        _addPool(_allocPoint, _lpToken, _depositFeeBP);
+    }
+    function operatorsAddPool(uint256 _allocPoint, IERC20 _lpToken, uint16 _depositFeeBP) external onlyOperator {
+        _addPool(_allocPoint, _lpToken, _depositFeeBP);
+    }
 
     // Update the given pool's OMEN allocation point and deposit fee. Can only be called by the owner.
-    function set(uint256 _pid, uint256 _allocPoint, uint16 _depositFeeBP) external onlyOwner {
+    function _setPool(uint256 _pid, uint256 _allocPoint, uint16 _depositFeeBP) private {
         require(_depositFeeBP <= 10000, "set: invalid deposit fee basis points");
         totalAllocPoint = totalAllocPoint.sub(poolInfo[_pid].allocPoint).add(_allocPoint);
         poolInfo[_pid].allocPoint = _allocPoint;
         poolInfo[_pid].depositFeeBP = _depositFeeBP;
+    }
+    function set(uint256 _pid, uint256 _allocPoint, uint16 _depositFeeBP) external onlyOwner {
+        _setPool(_pid, _allocPoint, _depositFeeBP);
+    }
+    function operatorSetPool(uint256 _pid, uint256 _allocPoint, uint16 _depositFeeBP) external onlyOperator {
+        _setPool(_pid, _allocPoint, _depositFeeBP);
     }
 
     // Return reward multiplier over the given _from to _to block.
@@ -250,10 +262,10 @@ contract MasterAugur is Ownable, ReentrancyGuard, Operators {
             } else {
                 user.amount = user.amount.add(_amount);
             }
+
+            dividends.setUserStakedAmount(_pid, _to, user.amount);
         }
         user.rewardDebt = user.amount.mul(pool.accOmenPerShare).div(1e18);
-
-        dividends.setUserStakedAmount(_pid, _to, user.amount);
         emit Deposit(_to, _pid, _amount);
     }
 
@@ -271,10 +283,9 @@ contract MasterAugur is Ownable, ReentrancyGuard, Operators {
         if (_amount > 0) {
             user.amount = user.amount.sub(_amount);
             pool.lpToken.safeTransfer(_to, _amount);
+            dividends.setUserStakedAmount(_pid, _to,  user.amount);
         }
         user.rewardDebt = user.amount.mul(pool.accOmenPerShare).div(1e18);
-
-        dividends.setUserStakedAmount(_pid, _to,  user.amount);
         emit Withdraw(msg.sender, _pid, _amount);
     }
 
@@ -284,6 +295,7 @@ contract MasterAugur is Ownable, ReentrancyGuard, Operators {
         UserInfo storage user = userInfo[_pid][msg.sender];
         uint256 amount = user.amount;
         user.amount = 0;
+        dividends.setUserStakedAmount(_pid, msg.sender, 0);
         user.rewardDebt = 0;
         pool.lpToken.safeTransfer(address(msg.sender), amount);
         emit EmergencyWithdraw(msg.sender, _pid, amount);
@@ -305,10 +317,16 @@ contract MasterAugur is Ownable, ReentrancyGuard, Operators {
         communityAddress = _communityAddress;
         emit SetCommunityAddress(msg.sender, _communityAddress);
     }
-
-    function setDevAddress(address _devAddress) external onlyOwner {
+    
+    function _setDevAddress(address _devAddress) private {
         devAddress = _devAddress;
         emit SetDevAddress(msg.sender, _devAddress);
+    }
+    function setDevAddress(address _devAddress) external onlyOwner {
+        _setDevAddress(_devAddress);
+    }
+    function operatorSetDevAddress(address _devAddress) external onlyOperator {
+        _setDevAddress(_devAddress);
     }
     
     function updateEmissionRate(uint256 _omenPerBlock) external onlyOwner {
@@ -355,11 +373,13 @@ contract MasterAugur is Ownable, ReentrancyGuard, Operators {
     }
 
     // Dividends
-    function calculateRequestorDividendsAmountFromNow() external view returns (uint256) {
-        return dividends.calculateOwedDividendsFromNow_d6(msg.sender);
+    function changeDividendsContract(IDividends _dividends) external onlyOperator {
+        dividends = _dividends;
+        dividends.updateOperator(address(_dividends), true);
+        dividendsContractAddress = address(_dividends);
     }
 
-    function collectDividends() external {
-        dividends.collectUserDividends(msg.sender);
+    function setDividendsOperator(address _operatorAddress, bool _access) external onlyOperator {
+        dividends.updateOperator(_operatorAddress, _access);
     }
 }
