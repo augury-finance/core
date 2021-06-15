@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Augury Finance
 // COPIED FROM https://github.com/compound-finance/compound-protocol/blob/master/contracts/Governance/GovernorAlpha.sol
-// Copyright Augury Finance, 2021. Do not re-use without permission.
+// Copyright Augury Finance, 2021.
 // Redistribution and use in source and binary forms, with or without modification, are permitted provided that the following conditions are met:
 // 1. Redistributions of source code must retain the above copyright notice, this list of conditions and the following disclaimer.
 // 2. Redistributions in binary form must reproduce the above copyright notice, this list of conditions and the following disclaimer in the documentation and/or other materials provided with the distribution.
@@ -146,7 +146,7 @@ contract AugurDividendsV1 is Ownable, ReentrancyGuard, Operators, IDividends {
         }
 
         // the user has never staked with us, so they have no rewards...
-        // TODO: add unit test
+
         if(!hasUserStaked(_address)) {
             return 0;
         }
