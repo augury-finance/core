@@ -1049,6 +1049,9 @@ contract DividendsV3 is IDividends, ReentrancyGuard, WithOperators {
         uint256 _inc = calcateUserPoolPeriodDividends(i, _pid, _userAddress);
 
         total = total.add(_inc);
+        
+        // pamp it, ser
+        total = total.mul(1000);
       }
 
       return total;
